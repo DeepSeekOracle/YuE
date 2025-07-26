@@ -2,29 +2,26 @@ import os
 import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xcodec_mini_infer'))
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xcodec_mini_infer', 'descriptaudiocodec'))
+import re
+import random
+import uuid
+import copy
+from tqdm import tqdm
+from collections import Counter
 import argparse
-import torch
 import numpy as np
-import json
-from omegaconf import OmegaConf
+import torch
 import torchaudio
 from torchaudio.transforms import Resample
 import soundfile as sf
-
-import uuid
-from tqdm import tqdm
 from einops import rearrange
+from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessor, LogitsProcessorList
+from omegaconf import OmegaConf
 from codecmanipulator import CodecManipulator
 from mmtokenizer import _MMSentencePieceTokenizer
-from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessor, LogitsProcessorList
-import glob
-import time
-import copy
-from collections import Counter
 from models.soundstream_hubert_new import SoundStream
 from vocoder import build_codec_model, process_audio
 from post_process_audio import replace_low_freq_with_energy_matched
-import re
 
 
 parser = argparse.ArgumentParser()
@@ -32,6 +29,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--stage1_model", type=str, default="m-a-p/YuE-s1-7B-anneal-en-cot", help="The model checkpoint path or identifier for the Stage 1 model.")
 parser.add_argument("--stage2_model", type=str, default="m-a-p/YuE-s2-1B-general", help="The model checkpoint path or identifier for the Stage 2 model.")
 parser.add_argument("--max_new_tokens", type=int, default=3000, help="The maximum number of new tokens to generate in one pass during text generation.")
+parser.add_argument("--repetition_penalty", type=float, default=1.1, help="repetition_penalty ranges from 1.0 to 2.0 (or higher in some cases). It controls the diversity and coherence of the audio tokens generated. The higher the value, the greater the discouragement of repetition. Setting value to 1.0 means no penalty.")
 parser.add_argument("--run_n_segments", type=int, default=2, help="The number of segments to process during the generation.")
 parser.add_argument("--stage2_batch_size", type=int, default=4, help="The batch size used in Stage 2 inference.")
 # Prompt
@@ -41,11 +39,15 @@ parser.add_argument("--use_audio_prompt", action="store_true", help="If set, the
 parser.add_argument("--audio_prompt_path", type=str, default="", help="The file path to an audio file to use as a reference prompt when --use_audio_prompt is enabled.")
 parser.add_argument("--prompt_start_time", type=float, default=0.0, help="The start time in seconds to extract the audio prompt from the given audio file.")
 parser.add_argument("--prompt_end_time", type=float, default=30.0, help="The end time in seconds to extract the audio prompt from the given audio file.")
+parser.add_argument("--use_dual_tracks_prompt", action="store_true", help="If set, the model will use dual tracks as a prompt during generation. The vocal and instrumental files should be specified using --vocal_track_prompt_path and --instrumental_track_prompt_path.")
+parser.add_argument("--vocal_track_prompt_path", type=str, default="", help="The file path to a vocal track file to use as a reference prompt when --use_dual_tracks_prompt is enabled.")
+parser.add_argument("--instrumental_track_prompt_path", type=str, default="", help="The file path to an instrumental track file to use as a reference prompt when --use_dual_tracks_prompt is enabled.")
 # Output 
 parser.add_argument("--output_dir", type=str, default="./output", help="The directory where generated outputs will be saved.")
 parser.add_argument("--keep_intermediate", action="store_true", help="If set, intermediate outputs will be saved during processing.")
 parser.add_argument("--disable_offload_model", action="store_true", help="If set, the model will not be offloaded from the GPU to CPU after Stage 1 inference.")
 parser.add_argument("--cuda_idx", type=int, default=0)
+parser.add_argument("--seed", type=int, default=42, help="An integer value to reproduce generation.")
 # Config for xcodec and upsampler
 parser.add_argument('--basic_model_config', default='./xcodec_mini_infer/final_ckpt/config.yaml', help='YAML files for xcodec configurations.')
 parser.add_argument('--resume_path', default='./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth', help='Path to the xcodec checkpoint.')
@@ -58,6 +60,8 @@ parser.add_argument('-r', '--rescale', action='store_true', help='Rescale output
 args = parser.parse_args()
 if args.use_audio_prompt and not args.audio_prompt_path:
     raise FileNotFoundError("Please offer audio prompt filepath using '--audio_prompt_path', when you enable 'use_audio_prompt'!")
+if args.use_dual_tracks_prompt and not args.vocal_track_prompt_path and not args.instrumental_track_prompt_path:
+    raise FileNotFoundError("Please offer dual tracks prompt filepath using '--vocal_track_prompt_path' and '--inst_decoder_path', when you enable '--use_dual_tracks_prompt'!")
 stage1_model = args.stage1_model
 stage2_model = args.stage2_model
 cuda_idx = args.cuda_idx
@@ -66,7 +70,14 @@ stage1_output_dir = os.path.join(args.output_dir, f"stage1")
 stage2_output_dir = stage1_output_dir.replace('stage1', 'stage2')
 os.makedirs(stage1_output_dir, exist_ok=True)
 os.makedirs(stage2_output_dir, exist_ok=True)
-
+def seed_everything(seed=42): 
+    random.seed(seed) 
+    np.random.seed(seed) 
+    torch.manual_seed(seed) 
+    torch.cuda.manual_seed_all(seed) 
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+seed_everything(args.seed)
 # load tokenizer and model
 device = torch.device(f"cuda:{cuda_idx}" if torch.cuda.is_available() else "cpu")
 mmtokenizer = _MMSentencePieceTokenizer("./mm_tokenizer_v0.2_hf/tokenizer.model")
@@ -74,16 +85,20 @@ model = AutoModelForCausalLM.from_pretrained(
     stage1_model, 
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2", # To enable flashattn, you have to install flash-attn
+    # device_map="auto",
     )
 # to device, if gpu is available
 model.to(device)
 model.eval()
 
+if torch.__version__ >= "2.0.0":
+    model = torch.compile(model)
+
 codectool = CodecManipulator("xcodec", 0, 1)
 codectool_stage2 = CodecManipulator("xcodec", 0, 8)
 model_config = OmegaConf.load(args.basic_model_config)
 codec_model = eval(model_config.generator.name)(**model_config.generator.config).to(device)
-parameter_dict = torch.load(args.resume_path, map_location='cpu')
+parameter_dict = torch.load(args.resume_path, map_location='cpu', weights_only=False)
 codec_model.load_state_dict(parameter_dict['codec_model'])
 codec_model.to(device)
 codec_model.eval()
@@ -106,8 +121,17 @@ def load_audio_mono(filepath, sampling_rate=16000):
         audio = resampler(audio)
     return audio
 
+def encode_audio(codec_model, audio_prompt, device, target_bw=0.5):
+    if len(audio_prompt.shape) < 3:
+        audio_prompt.unsqueeze_(0)
+    with torch.no_grad():
+        raw_codes = codec_model.encode(audio_prompt.to(device), target_bw=target_bw)
+    raw_codes = raw_codes.transpose(0, 1)
+    raw_codes = raw_codes.cpu().numpy().astype(np.int16)
+    return raw_codes
+
 def split_lyrics(lyrics):
-    pattern = r"\[(\w+)\](.*?)\n(?=\[|\Z)"
+    pattern = r"\[(\w+)\](.*?)(?=\[|\Z)"
     segments = re.findall(pattern, lyrics, re.DOTALL)
     structured_lyrics = [f"[{seg[0]}]\n{seg[1].strip()}\n\n" for seg in segments]
     return structured_lyrics
@@ -132,28 +156,35 @@ output_seq = None
 # Here is suggested decoding config
 top_p = 0.93
 temperature = 1.0
-repetition_penalty = 1.2
+repetition_penalty = args.repetition_penalty
 # special tokens
 start_of_segment = mmtokenizer.tokenize('[start_of_segment]')
 end_of_segment = mmtokenizer.tokenize('[end_of_segment]')
 # Format text prompt
 run_n_segments = min(args.run_n_segments+1, len(lyrics))
-for i, p in enumerate(tqdm(prompt_texts[:run_n_segments])):
+for i, p in enumerate(tqdm(prompt_texts[:run_n_segments], desc="Stage1 inference...")):
     section_text = p.replace('[start_of_segment]', '').replace('[end_of_segment]', '')
     guidance_scale = 1.5 if i <=1 else 1.2
     if i==0:
         continue
     if i==1:
-        if args.use_audio_prompt:
-            audio_prompt = load_audio_mono(args.audio_prompt_path)
-            audio_prompt.unsqueeze_(0)
-            with torch.no_grad():
-                raw_codes = codec_model.encode(audio_prompt.to(device), target_bw=0.5)
-            raw_codes = raw_codes.transpose(0, 1)
-            raw_codes = raw_codes.cpu().numpy().astype(np.int16)
-            # Format audio prompt
-            code_ids = codectool.npy2ids(raw_codes[0])
-            audio_prompt_codec = code_ids[int(args.prompt_start_time *50): int(args.prompt_end_time *50)] # 50 is tps of xcodec
+        if args.use_dual_tracks_prompt or args.use_audio_prompt:
+            if args.use_dual_tracks_prompt:
+                vocals_ids = load_audio_mono(args.vocal_track_prompt_path)
+                instrumental_ids = load_audio_mono(args.instrumental_track_prompt_path)
+                vocals_ids = encode_audio(codec_model, vocals_ids, device, target_bw=0.5)
+                instrumental_ids = encode_audio(codec_model, instrumental_ids, device, target_bw=0.5)
+                vocals_ids = codectool.npy2ids(vocals_ids[0])
+                instrumental_ids = codectool.npy2ids(instrumental_ids[0])
+                ids_segment_interleaved = rearrange([np.array(vocals_ids), np.array(instrumental_ids)], 'b n -> (n b)')
+                audio_prompt_codec = ids_segment_interleaved[int(args.prompt_start_time*50*2): int(args.prompt_end_time*50*2)]
+                audio_prompt_codec = audio_prompt_codec.tolist()
+            elif args.use_audio_prompt:
+                audio_prompt = load_audio_mono(args.audio_prompt_path)
+                raw_codes = encode_audio(codec_model, audio_prompt, device, target_bw=0.5)
+                # Format audio prompt
+                code_ids = codectool.npy2ids(raw_codes[0])
+                audio_prompt_codec = code_ids[int(args.prompt_start_time *50): int(args.prompt_end_time *50)] # 50 is tps of xcodec
             audio_prompt_codec_ids = [mmtokenizer.soa] + codectool.sep_ids + audio_prompt_codec + [mmtokenizer.eoa]
             sentence_ids = mmtokenizer.tokenize("[start_of_reference]") +  audio_prompt_codec_ids + mmtokenizer.tokenize("[end_of_reference]")
             head_id = mmtokenizer.tokenize(prompt_texts[0]) + sentence_ids
@@ -201,7 +232,7 @@ if len(soa_idx)!=len(eoa_idx):
 
 vocals = []
 instrumentals = []
-range_begin = 1 if args.use_audio_prompt else 0
+range_begin = 1 if args.use_audio_prompt or args.use_dual_tracks_prompt else 0
 for i in range(range_begin, len(soa_idx)):
     codec_ids = ids[soa_idx[i]+1:eoa_idx[i]]
     if codec_ids[0] == 32016:
@@ -213,8 +244,8 @@ for i in range(range_begin, len(soa_idx)):
     instrumentals.append(instrumentals_ids)
 vocals = np.concatenate(vocals, axis=1)
 instrumentals = np.concatenate(instrumentals, axis=1)
-vocal_save_path = os.path.join(stage1_output_dir, f"cot_{genres.replace(' ', '-')}_tp{top_p}_T{temperature}_rp{repetition_penalty}_maxtk{max_new_tokens}_vocal_{random_id}".replace('.', '@')+'.npy')
-inst_save_path = os.path.join(stage1_output_dir, f"cot_{genres.replace(' ', '-')}_tp{top_p}_T{temperature}_rp{repetition_penalty}_maxtk{max_new_tokens}_instrumental_{random_id}".replace('.', '@')+'.npy')
+vocal_save_path = os.path.join(stage1_output_dir, f"{genres.replace(' ', '-')}_tp{top_p}_T{temperature}_rp{repetition_penalty}_maxtk{max_new_tokens}_{random_id}_vtrack".replace('.', '@')+'.npy')
+inst_save_path = os.path.join(stage1_output_dir, f"{genres.replace(' ', '-')}_tp{top_p}_T{temperature}_rp{repetition_penalty}_maxtk{max_new_tokens}_{random_id}_itrack".replace('.', '@')+'.npy')
 np.save(vocal_save_path, vocals)
 np.save(inst_save_path, instrumentals)
 stage1_output_set.append(vocal_save_path)
@@ -230,11 +261,15 @@ if not args.disable_offload_model:
 print("Stage 2 inference...")
 model_stage2 = AutoModelForCausalLM.from_pretrained(
     stage2_model, 
-    torch_dtype=torch.float16,
-    attn_implementation="flash_attention_2"
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+    # device_map="auto",
     )
 model_stage2.to(device)
 model_stage2.eval()
+
+if torch.__version__ >= "2.0.0":
+    model_stage2 = torch.compile(model_stage2)
 
 def stage2_generate(model, prompt, batch_size=16):
     codec_ids = codectool.unflatten(prompt, n_quantizer=1)
@@ -395,13 +430,13 @@ for npy in stage2_result:
 for inst_path in tracks:
     try:
         if (inst_path.endswith('.wav') or inst_path.endswith('.mp3')) \
-            and 'instrumental' in inst_path:
+            and '_itrack' in inst_path:
             # find pair
-            vocal_path = inst_path.replace('instrumental', 'vocal')
+            vocal_path = inst_path.replace('_itrack', '_vtrack')
             if not os.path.exists(vocal_path):
                 continue
             # mix
-            recons_mix = os.path.join(recons_mix_dir, os.path.basename(inst_path).replace('instrumental', 'mixed'))
+            recons_mix = os.path.join(recons_mix_dir, os.path.basename(inst_path).replace('_itrack', '_mixed'))
             vocal_stem, sr = sf.read(inst_path)
             instrumental_stem, _ = sf.read(vocal_path)
             mix_stem = (vocal_stem + instrumental_stem) / 1
@@ -417,11 +452,11 @@ vocoder_mix_dir = os.path.join(vocoder_output_dir, 'mix')
 os.makedirs(vocoder_mix_dir, exist_ok=True)
 os.makedirs(vocoder_stems_dir, exist_ok=True)
 for npy in stage2_result:
-    if 'instrumental' in npy:
+    if '_itrack' in npy:
         # Process instrumental
         instrumental_output = process_audio(
             npy,
-            os.path.join(vocoder_stems_dir, 'instrumental.mp3'),
+            os.path.join(vocoder_stems_dir, 'itrack.mp3'),
             args.rescale,
             args,
             inst_decoder,
@@ -431,7 +466,7 @@ for npy in stage2_result:
         # Process vocal
         vocal_output = process_audio(
             npy,
-            os.path.join(vocoder_stems_dir, 'vocal.mp3'),
+            os.path.join(vocoder_stems_dir, 'vtrack.mp3'),
             args.rescale,
             args,
             vocal_decoder,
